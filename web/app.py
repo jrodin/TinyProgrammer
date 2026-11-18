@@ -283,7 +283,7 @@ def create_app():
                 _brain.llm.set_model(selected_model)
 
             updates['LLM_TEMPERATURE'] = float(request.form.get('llm_temperature', 0.7))
-            updates['LLM_MAX_TOKENS'] = int(request.form.get('llm_max_tokens', 512))
+            updates['LLM_MAX_TOKENS'] = int(request.form.get('llm_max_tokens', 768))
 
             # Timing settings
             updates['WATCH_DURATION_MIN'] = int(request.form.get('watch_duration_min', 120))

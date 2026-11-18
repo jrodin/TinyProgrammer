@@ -69,6 +69,62 @@ def _python_output_rules(model_name: str) -> str:
     return LONG_PYTHON_OUTPUT_RULES
 
 
+class _LoopGuard:
+    """Detect degenerate repetition while streaming model output.
+
+    Small/quantized models occasionally fall into a loop and re-emit the same
+    line until they hit max_tokens (qwen3.5-9b did this with `ball_r = 20`
+    repeated ~30 times). Streams that hit this look superficially successful
+    but never finish, so callers need a signal to fail and retry.
+
+    Line based, because that is how the failure actually shows up: a short
+    program may legitimately repeat `c.show()` or `c.clear(0, 0, 0)` a few
+    times in different branches, but never the same non-trivial line four
+    times inside a six-line window. Two- and three-line cycles are caught by
+    the period check, with a length floor so boilerplate pairs don't trip it.
+    """
+
+    WINDOW = 6
+    REPEATS = 4
+    MIN_LINE_CHARS = 10
+    MIN_CYCLE_CHARS = 40
+
+    def __init__(self):
+        self.text = ""
+
+    def feed(self, chunk: str) -> bool:
+        """Append a token/chunk; return True when output has degenerated."""
+        self.text += chunk
+        if len(self.text) > 8000:
+            self.text = self.text[-4000:]
+
+        lines = [line.strip() for line in self.text.splitlines() if line.strip()]
+
+        # Same line repeated nearly back-to-back.
+        window = lines[-self.WINDOW:]
+        if len(window) >= self.REPEATS:
+            counts = {}
+            for line in window:
+                if len(line) < self.MIN_LINE_CHARS:
+                    continue
+                counts[line] = counts.get(line, 0) + 1
+                if counts[line] >= self.REPEATS:
+                    return True
+
+        # Short cycle: A B A B A B (or A B C A B C ...). Measure one period,
+        # so boilerplate pairs like c.show()/c.sleep(0.067) don't trip it.
+        for period in (2, 3):
+            tail = lines[-period * 3:]
+            if len(tail) < period * 3:
+                continue
+            if sum(len(line) for line in tail[:period]) < self.MIN_CYCLE_CHARS:
+                continue
+            if tail[:period] == tail[period:period * 2] == tail[period * 2:]:
+                return True
+
+        return False
+
+
 def detect_ollama_models(endpoint=None):
     """
     Detect if Ollama is running and list locally available models.
@@ -148,6 +204,7 @@ class LLMGenerator:
         self.model_name = model_name or DEFAULT_MODEL     # Actual model to use
         self._last_request_time = 0
         self.current_seed = None  # Seed for current program
+        self.last_looped = False  # Set when the last stream degenerated into repetition
 
         # If surprise mode, pick a random model now
         if self.model_setting == SURPRISE_ME:
@@ -229,11 +286,29 @@ class LLMGenerator:
         """
         Stream text completion token by token.
         Routes to OpenRouter (cloud) or Ollama (local) based on model prefix.
+
+        Chunks pass through a loop guard: if the model starts repeating itself,
+        the stream is cut short and self.last_looped is set so the caller can
+        fail the program and retry instead of archiving a runaway generation.
         """
+        self.last_looped = False
         if self.model_name.startswith("ollama/"):
-            yield from self._stream_ollama(prompt, max_tokens, temperature, stop)
+            source = self._stream_ollama(prompt, max_tokens, temperature, stop)
         else:
-            yield from self._stream_openrouter(prompt, max_tokens, temperature, stop)
+            source = self._stream_openrouter(prompt, max_tokens, temperature, stop)
+
+        guard = _LoopGuard()
+        try:
+            for chunk in source:
+                if guard.feed(chunk):
+                    self.last_looped = True
+                    print("[LLM] Stopped: repetition loop detected")
+                    break
+                yield chunk
+        finally:
+            close = getattr(source, "close", None)
+            if close:
+                close()
 
     def _stream_openrouter(self, prompt: str, max_tokens: int,
                            temperature: float, stop: list) -> Generator[str, None, None]:
@@ -428,6 +503,7 @@ class LLMGenerator:
             "- Start with variables, then while True loop\n"
             f"- Canvas: {canvas_w}x{canvas_h} pixels\n"
             "- RGB values are integers 0-255 (NOT floats 0.0-1.0)\n"
+            "- Pass r, g, b as three separate integer arguments (never a color tuple or list)\n"
             f"{budget_rules}"
             "- Add short casual comments like a human thinking out loud\n"
             "  e.g. '# hmm let's try a spiral', '# this should bounce nicely'\n\n"
@@ -471,7 +547,8 @@ class LLMGenerator:
             f"- Canvas: {canvas_w}x{canvas_h} pixels\n\n"
             f"{budget_rules}\n"
             "Methods on 'c': clear, pixel, line, rect, fill_rect, circle, fill_circle, show, sleep\n"
-            "All draw methods take r,g,b after coordinates. c.show() takes no args.\n\n"
+            "All draw methods take r,g,b after coordinates. c.show() takes no args.\n"
+            "Pass r,g,b as three separate integers, never a tuple.\n\n"
             f"{_python_output_rules(self.model_name)}"
         )
         return prompt
@@ -532,6 +609,7 @@ class LLMGenerator:
             "- Start with variables, then while True loop\n"
             f"- Canvas: {canvas_w}x{canvas_h} pixels\n"
             "- RGB values are integers 0-255 (NOT floats 0.0-1.0)\n"
+            "- Pass r, g, b as three separate integer arguments (never a color tuple or list)\n"
             f"{budget_rules}\n"
             "ONLY these methods exist on 'c':\n"
             "  c.clear(r,g,b)\n"
