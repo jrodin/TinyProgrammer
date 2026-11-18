@@ -69,6 +69,21 @@ def _python_output_rules(model_name: str) -> str:
     return LONG_PYTHON_OUTPUT_RULES
 
 
+LOCAL_CANVAS_API = (
+    "These are the ONLY canvas methods (r, g, b are three separate ints 0-255):\n"
+    "  c.clear(r, g, b)\n"
+    "  c.pixel(x, y, r, g, b)\n"
+    "  c.line(x1, y1, x2, y2, r, g, b)\n"
+    "  c.rect(x, y, w, h, r, g, b)\n"
+    "  c.fill_rect(x, y, w, h, r, g, b)\n"
+    "  c.circle(x, y, radius, r, g, b)\n"
+    "  c.fill_circle(x, y, radius, r, g, b)\n"
+    "  c.show()\n"
+    "  c.sleep(seconds)\n"
+    "Never invent another canvas method. Never name a variable `c`.\n\n"
+)
+
+
 class _LoopGuard:
     """Detect degenerate repetition while streaming model output.
 
@@ -461,9 +476,10 @@ class LLMGenerator:
         if program_type == "wireframe_plot":
             return self._build_wireframe_prompt(lessons)
 
-        # Local Ollama models get a stripped-down prompt (weak instruction following)
+        # Local Ollama models get a compact, example-led prompt (weak
+        # instruction following: they copy header text and invent methods).
         if self.model_name.startswith("ollama/"):
-            return self._build_simple_prompt(program_type, creative)
+            return self._build_simple_prompt(program_type, creative, lessons)
 
         description = _resolve_description(program_type)
 
@@ -523,35 +539,61 @@ class LLMGenerator:
 
         return prompt
 
-    def _build_simple_prompt(self, program_type: str, creative: dict = None) -> str:
-        """Stripped-down prompt for local Ollama models (weak instruction following).
+    def _build_simple_prompt(self, program_type: str, creative: dict = None,
+                             lessons: str = "") -> str:
+        """Compact, example-led prompt for local models (weak instruction following).
 
-        Only includes: program type, palette, rules, API. No style, no seed,
-        no mood directive, no creative direction block.
+        Local models copy any header text you show them, re-import modules,
+        and invent canvas methods. This version states the API once, forbids
+        the header explicitly, and shows only the shape of the answer.
         """
         description = _resolve_description(program_type)
         canvas_w = config.CANVAS_DRAW_W
         canvas_h = config.CANVAS_DRAW_H
-        budget_rules = _canvas_budget_rules()
+        _, sleep_seconds, max_draw_calls = _canvas_frame_budget()
 
         palette = ""
         if creative and creative.get("palette"):
-            palette = f"Use a {creative['palette']} color palette.\n"
+            palette = f"Use a {creative['palette']} palette.\n\n"
 
-        prompt = (
-            f"Write a short Python program that {description}.\n"
-            f"{palette}\n"
-            "RULES:\n"
-            "- 20-50 lines of code, no imports\n"
-            "- Start with variables, then while True loop\n"
-            f"- Canvas: {canvas_w}x{canvas_h} pixels\n\n"
-            f"{budget_rules}\n"
-            "Methods on 'c': clear, pixel, line, rect, fill_rect, circle, fill_circle, show, sleep\n"
-            "All draw methods take r,g,b after coordinates. c.show() takes no args.\n"
-            "Pass r,g,b as three separate integers, never a tuple.\n\n"
-            f"{_python_output_rules(self.model_name)}"
+        notes = ""
+        if lessons:
+            notes = (
+                "Past notes from earlier mistakes (ignore anything that "
+                "contradicts the rules):\n"
+                f"{lessons}\n\n"
+            )
+
+        return (
+            f"Write a short Python program that {description}\n\n"
+            f"{palette}"
+            "The file already imports time, random, and math and creates the\n"
+            "canvas object `c`. Do not write any import or from line, and do not\n"
+            "create or reassign `c`. Start your first line at column 0.\n\n"
+            f"{LOCAL_CANVAS_API}"
+            "Rules:\n"
+            "- Use at most ONE small `def` helper if it makes the logic clearer;\n"
+            "  define it BEFORE the loop, pass values as arguments, and never\n"
+            "  assign to outside variables inside it. Otherwise keep everything\n"
+            "  top-level. No classes, no main().\n"
+            "- Setup and the animation loop stay at top level: exactly one\n"
+            "  `while True:` loop, at the end.\n"
+            f"- Canvas is {canvas_w}x{canvas_h}. Clamp every object inside those bounds.\n"
+            f"- Draw something every frame, then c.show() and c.sleep({sleep_seconds}).\n"
+            f"- Keep each frame under about {max_draw_calls} draw calls.\n"
+            "- Do not name variables `c`, `time`, `random`, or `math`.\n"
+            "- 20-35 lines total. Stop when the loop body ends.\n\n"
+            "Shape of the answer (write your own; do not copy it):\n"
+            "  x, y = 100, 100\n"
+            "  while True:\n"
+            "      c.clear(10, 10, 30)\n"
+            "      # update x and y with motion and bounds checks\n"
+            "      c.fill_circle(x, y, 8, 255, 200, 0)\n"
+            "      c.show()\n"
+            f"      c.sleep({sleep_seconds})\n\n"
+            f"{notes}"
+            "Output ONLY the program lines. No markdown, no prose, no comments.\n"
         )
-        return prompt
 
     def _build_wireframe_prompt(self, lessons: str = "") -> str:
         """Special prompt for wireframe_plot — uses the Plot3D helper."""
@@ -627,35 +669,54 @@ class LLMGenerator:
         return prompt
 
     def build_reflection_prompt(self, code: str, program_type: str, result: str) -> str:
-        """Build a prompt to learn from code execution."""
-        canvas_w = config.CANVAS_DRAW_W
-        canvas_h = config.CANVAS_DRAW_H
-
-        prompt = (
+        """Build a prompt to learn one concrete lesson from a real failure."""
+        result = (result or "").strip()[:400]
+        return (
             f"You wrote this Python program (a {program_type}):\n\n"
             f"{code}\n\n"
             f"Execution result: {result}\n\n"
-            "What is ONE technical lesson to remember for next time?\n"
-            "Focus on syntax, libraries, or logic errors.\n"
-            "Examples:\n"
-            "- 'Do not use c.move() because it does not exist.'\n"
-            "- 'Always initialize variables before the loop.'\n"
-            f"- 'The canvas size is {canvas_w}x{canvas_h}.'\n"
-            "\n"
-            "Write ONLY the lesson (1 sentence).\n"
+            "If this was a real Python error, write ONE short lesson (max 160\n"
+            "characters) that would prevent it next time. Name the exact method\n"
+            "or variable involved.\n"
+            "If it was not a real Python error, or you are unsure, reply with\n"
+            "exactly: NONE\n\n"
+            "Rules:\n"
+            "- One sentence. No preamble, no label, no quotes.\n"
+            "- Only mention canvas methods from this list: clear, pixel, line,\n"
+            "  rect, fill_rect, circle, fill_circle, show, sleep.\n"
+            "- Never say a library needs to be installed.\n"
+            "- Never suggest moving variable setup into the animation loop.\n"
         )
-        return prompt
 
     def build_fix_prompt(self, code: str, error: str) -> str:
         """Build a prompt to fix broken code."""
+        # Keep the prompt small: an unbounded error blob (stack traces, stray
+        # output) can push the request past the server's context window.
+        error = (error or "").strip()[:1200]
+        plot_rules = ""
+        if "Plot3D" in code:
+            plot_rules = (
+                "- This is a wireframe script: keep using p.set_range, "
+                "p.set_grid,\np.set_rotation_speed, and p.run(func).\n"
+            )
         prompt = (
             "The following Python script failed:\n\n"
             f"{code}\n\n"
             f"Error: {error}\n\n"
-            "FIX IT. Write ONLY the fixed code.\n"
+            "FIX IT. Write ONLY the complete fixed program.\n"
             "Constraints:\n"
             "- Keep it simple.\n"
-            "- Use 'c' for drawing.\n\n"
+            "- Do not write import/from lines; time, random, math, and Canvas\n"
+            "  are already at the top.\n"
+            "- Do not create or reassign `c` (or `p`); they already exist.\n"
+            "- Canvas methods: clear, pixel, line, rect, fill_rect, circle,\n"
+            "  fill_circle, show, sleep. Pass r, g, b as separate ints.\n"
+            f"{plot_rules}"
+            "- At most one small `def` helper; keep the while True loop at top\n"
+            "  level. No classes, no main().\n"
+            "- 20-35 lines total.\n"
+            "- Change only what the error requires.\n"
+            "- Keep all existing bounds and safety checks.\n\n"
             f"{_python_output_rules(self.model_name)}"
         )
         return prompt
