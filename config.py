@@ -191,7 +191,7 @@ ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"  # Haiku 4.5
 
 # Generation settings
 LLM_CONTEXT_SIZE = 4096
-LLM_MAX_TOKENS = 512
+LLM_MAX_TOKENS = 768
 LLM_TEMPERATURE = 0.7
 LLM_STOP_TOKENS = ["```", "# END", "if __name__"]
 

@@ -612,7 +612,27 @@ class Brain:
         # same parseable Python (issue #43).
         code = _clean_generated_code(self.current_program.code)
         self.current_program.code = code
-        
+
+        # 0. Degenerate repetition. The LLM client cuts the stream when the
+        # model starts looping, so whatever we have is incomplete even if it
+        # happens to parse. Fail and retry instead of running/archiving it.
+        if getattr(self.llm, "last_looped", False):
+            msg = (
+                "The previous response got stuck repeating the same line and "
+                "never finished. Rewrite it SHORTER (under 40 lines) without "
+                "repeating lines."
+            )
+            log_error(self.current_program.program_type, "review", msg)
+            self.terminal.type_string("# got stuck repeating myself!\n")
+            if self.fix_attempts < 2:
+                self.current_program.error_message = msg
+                self._transition(State.FIX)
+                return
+            self.terminal.type_string("# still stuck, giving up.\n")
+            self.current_program.success = False
+            self._transition(State.ARCHIVE)
+            return
+
         # 1. Check for banned imports
         banned = ["pygame", "turtle", "tkinter", "matplotlib"]
         for lib in banned:
@@ -817,7 +837,7 @@ class Brain:
         except Exception:
             pass
             
-        if lesson:
+        if lesson and not getattr(self.llm, "last_looped", False):
             self.learning.add_lesson(lesson)
             self.terminal.type_string("\n# saved to memory.\n")
         
