@@ -581,6 +581,9 @@ class LLMGenerator:
             f"- Canvas is {canvas_w}x{canvas_h}. Clamp every object inside those bounds.\n"
             f"- Call c.clear() at the START of each loop, before any drawing.\n"
             f"- Draw something every frame, then c.show() and c.sleep({sleep_seconds}).\n"
+            "- The frame must visibly change: at least one number passed to a\n"
+            "  draw call must differ from the previous frame. If your state\n"
+            "  never changes, add a frame counter and use it in a draw call.\n"
             f"- Keep each frame under about {max_draw_calls} draw calls.\n"
             "- Define every variable before using it; never reuse a name for two\n"
             "  different things (such as radius and color).\n"
@@ -588,10 +591,11 @@ class LLMGenerator:
             "- Do not name variables `c`, `time`, `random`, or `math`.\n"
             "- 20-35 lines total. Stop when the loop body ends.\n\n"
             "Shape of the answer (write your own; do not copy it):\n"
-            "  x, y = 100, 100\n"
+            "  frame, x, y = 0, 100, 100\n"
             "  while True:\n"
+            "      frame += 1\n"
             "      c.clear(10, 10, 30)\n"
-            "      # update x and y with motion and bounds checks\n"
+            "      x = (x + 2) % 693\n"
             "      c.fill_circle(x, y, 8, 255, 200, 0)\n"
             "      c.show()\n"
             f"      c.sleep({sleep_seconds})\n\n"
@@ -703,6 +707,14 @@ class LLMGenerator:
                 "- This is a wireframe script: keep using p.set_range, "
                 "p.set_grid,\np.set_rotation_speed, and p.run(func).\n"
             )
+        motion_rules = ""
+        if "nothing changed" in error or "static" in error.lower():
+            motion_rules = (
+                "- THE FRAME IS IDENTICAL EVERY TIME. Make at least one number\n"
+                "  passed to a draw call depend on a value that changes inside\n"
+                "  the loop (a frame counter you increment each pass works).\n"
+                "  A variable set once before the loop does not animate.\n"
+            )
         prompt = (
             "The following Python script failed:\n\n"
             f"{code}\n\n"
@@ -716,6 +728,7 @@ class LLMGenerator:
             "- Canvas methods: clear, pixel, line, rect, fill_rect, circle,\n"
             "  fill_circle, show, sleep. Pass r, g, b as separate ints.\n"
             f"{plot_rules}"
+            f"{motion_rules}"
             "- At most one small `def` helper; keep the while True loop at top\n"
             "  level. No classes, no main().\n"
             "- 20-35 lines total.\n"
