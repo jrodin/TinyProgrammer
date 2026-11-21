@@ -130,6 +130,35 @@ def _unknown_canvas_methods(code: str) -> list[str]:
     return sorted(found)
 
 
+def _canvas_rebound(code: str) -> bool:
+    """True when the body rebinds/shadows ``c`` after the runner header.
+
+    The canonical header owns the name ``c``. A later ``c = ...`` or
+    ``for c in ...`` replaces the Canvas object, so drawing fails at runtime
+    -- often only after a full WATCH. Checking the AST avoids false positives
+    from comments and strings.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if not (isinstance(target, ast.Name) and target.id == "c"):
+                    continue
+                value = node.value
+                if (isinstance(value, ast.Call)
+                        and isinstance(value.func, ast.Name)
+                        and value.func.id == "Canvas"):
+                    continue  # canonical header
+                return True
+        elif isinstance(node, (ast.AugAssign, ast.For, ast.comprehension)):
+            if isinstance(node.target, ast.Name) and node.target.id == "c":
+                return True
+    return False
+
+
 def _clean_generated_code(raw: str) -> str:
     """Strip fences and any repeated runner header from generated code.
 
@@ -767,6 +796,25 @@ class Brain:
             )
             log_error(self.current_program.program_type, "review", msg)
             self.terminal.type_string("# I invented a canvas method!\n")
+            if self.fix_attempts < 2:
+                self.current_program.error_message = msg
+                self._transition(State.FIX)
+                return
+            self.current_program.error_message = msg
+            self.current_program.success = False
+            self._transition(State.ARCHIVE)
+            return
+
+        # 2b. A later assignment or loop target named `c` destroys the Canvas
+        # object created by the header. Catch it before RUN/WATCH.
+        if _canvas_rebound(code):
+            msg = (
+                "The canvas variable `c` is reassigned or used as a loop "
+                "variable. Keep `c` for Canvas methods only; use names like "
+                "col, cell, or idx for loops and counters."
+            )
+            log_error(self.current_program.program_type, "review", msg)
+            self.terminal.type_string("# I shadowed the canvas variable!\n")
             if self.fix_attempts < 2:
                 self.current_program.error_message = msg
                 self._transition(State.FIX)
