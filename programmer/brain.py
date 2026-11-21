@@ -229,6 +229,7 @@ class Brain:
         self.programs_written = 0
         self.fix_attempts = 0
         self._restart_requested = False
+        self._restart_rejected = False
         self._bbs_breaks_taken = 0
         self._last_lurk_time = 0
         self._current_creative = None
@@ -869,11 +870,25 @@ class Brain:
         
         Let the program run for a while, display its output.
         """
-        exit_code, last_output, _, saw_flip = self._watch_running_process(
+        exit_code, last_output, stop_reason, saw_flip = self._watch_running_process(
             "WATCHING",
             self.personality.get_mood_status(),
             "\n# Program finished early.\n",
         )
+        if stop_reason == "restart":
+            # A restart is a user rejection, not a verdict that the run was
+            # fine. People usually press it because the program failed or
+            # looks wrong. Record it as a failed run, but don't waste cycles
+            # auto-fixing or inventing a lesson from a message with no detail.
+            self._restart_rejected = True
+            if self.current_program:
+                self.current_program.success = False
+                self.current_program.error_message = (
+                    "Restarted by user before the run was accepted"
+                )
+            self.terminal.type_string("# restart — not counting this as a win.\n")
+            self._transition(State.ARCHIVE)
+            return
         if self.current_program:
             self.current_program.canvas_protocol = (
                 CANVAS_PROTOCOL_BATCHED if saw_flip else CANVAS_PROTOCOL_LEGACY
@@ -1054,6 +1069,12 @@ class Brain:
         })
         
         time.sleep(1)
+        if self._restart_rejected:
+            # No concrete failure detail to learn from; a generic lesson
+            # would pollute later prompts.
+            self._restart_rejected = False
+            self._transition(State.THINK)
+            return
         self._transition(State.REFLECT)
     
     def _do_error(self):

@@ -578,12 +578,17 @@ class LLMGenerator:
             "  top-level. No classes, no main().\n"
             "- Setup and the animation loop stay at top level: exactly one\n"
             "  `while True:` loop, at the end.\n"
-            f"- Canvas is {canvas_w}x{canvas_h}. Clamp every object inside those bounds.\n"
+            f"- Canvas is {canvas_w}x{canvas_h}. Keep WHOLE shapes inside it.\n"
+            f"- For a circle of radius r, keep its center x between r and {canvas_w}-r\n"
+            f"  and its center y between r and {canvas_h}-r. Clamping only the\n"
+            "  center to the edge still draws most of the circle off-screen.\n"
             f"- Call c.clear() at the START of each loop, before any drawing.\n"
             f"- Draw something every frame, then c.show() and c.sleep({sleep_seconds}).\n"
             "- The frame must visibly change: at least one number passed to a\n"
             "  draw call must differ from the previous frame. If your state\n"
             "  never changes, add a frame counter and use it in a draw call.\n"
+            "- If you use `frame`, write `frame = 0` on its own line BEFORE the\n"
+            "  loop, then do `frame += 1` inside it.\n"
             f"- Keep each frame under about {max_draw_calls} draw calls.\n"
             "- Define every variable before using it; never reuse a name for two\n"
             "  different things (such as radius and color).\n"
@@ -715,6 +720,13 @@ class LLMGenerator:
                 "  the loop (a frame counter you increment each pass works).\n"
                 "  A variable set once before the loop does not animate.\n"
             )
+        bounds_rules = ""
+        if "off-screen" in error or "bounds" in error.lower():
+            bounds_rules = (
+                "- OBJECTS GO OFF-SCREEN. Clamp the whole shape, including its\n"
+                "  radius or size, not just its center. For a circle of radius r\n"
+                "  keep x between r and width-r and y between r and height-r.\n"
+            )
         prompt = (
             "The following Python script failed:\n\n"
             f"{code}\n\n"
@@ -722,6 +734,7 @@ class LLMGenerator:
             "FIX IT. Write ONLY the complete fixed program.\n"
             "Constraints:\n"
             "- Keep it simple.\n"
+            "- If you use `frame`, initialize `frame = 0` before the loop.\n"
             "- Do not write import/from lines; time, random, math, and Canvas\n"
             "  are already at the top.\n"
             "- Do not create or reassign `c` (or `p`); they already exist.\n"
@@ -729,6 +742,7 @@ class LLMGenerator:
             "  fill_circle, show, sleep. Pass r, g, b as separate ints.\n"
             f"{plot_rules}"
             f"{motion_rules}"
+            f"{bounds_rules}"
             "- At most one small `def` helper; keep the while True loop at top\n"
             "  level. No classes, no main().\n"
             "- 20-35 lines total.\n"
