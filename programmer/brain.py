@@ -7,6 +7,7 @@ THINK → WRITE → REVIEW → RUN → WATCH → ARCHIVE → REFLECT → repeat
 Optional BBS breaks can lead into REMINISCE, which replays archived creations.
 """
 
+import ast
 import os
 import sys
 import json
@@ -96,6 +97,37 @@ def _parses_as_python(text: str) -> bool:
         return True
     except (SyntaxError, ValueError):
         return False
+
+
+# Public drawing/screen methods on Canvas. update/move and the underscore
+# methods are runner internals, not part of the language given to the model.
+_CANVAS_METHODS = frozenset({
+    "clear", "pixel", "line", "rect", "fill_rect", "circle", "fill_circle",
+    "show", "sleep",
+})
+
+
+def _unknown_canvas_methods(code: str) -> list[str]:
+    """Return called ``c.<name>`` methods that the canvas does not provide.
+
+    Checks the AST rather than raw text so comments and strings cannot trigger
+    a false positive. Invented methods (c._get_hash, c.new, c.random, ...) are
+    a frequent failure: without this check they only fail after a full WATCH,
+    and the FIX prompt then has to rediscover the same problem.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    found = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "c"
+                and node.func.attr not in _CANVAS_METHODS):
+            found.add(node.func.attr)
+    return sorted(found)
 
 
 def _clean_generated_code(raw: str) -> str:
@@ -721,7 +753,29 @@ class Brain:
                 self.current_program.success = False
                 self._transition(State.ARCHIVE)
                 return
-            
+
+        # 2a. Invented canvas methods are another common "looks fine until it
+        # runs" failure. Reject them here so FIX gets a precise hint instead of
+        # wasting a full WATCH cycle and a generic AttributeError.
+        bad_methods = _unknown_canvas_methods(code)
+        if bad_methods:
+            msg = (
+                "Unknown canvas method(s): "
+                + ", ".join(f"c.{name}" for name in bad_methods)
+                + ". Only these methods exist: "
+                + ", ".join(sorted(_CANVAS_METHODS)) + "."
+            )
+            log_error(self.current_program.program_type, "review", msg)
+            self.terminal.type_string("# I invented a canvas method!\n")
+            if self.fix_attempts < 2:
+                self.current_program.error_message = msg
+                self._transition(State.FIX)
+                return
+            self.current_program.error_message = msg
+            self.current_program.success = False
+            self._transition(State.ARCHIVE)
+            return
+
         self.terminal.type_string("# looks good!\n")
         time.sleep(0.5)
         self._transition(State.RUN)
@@ -778,6 +832,9 @@ class Brain:
             )
         if exit_code is None:
             self.current_program.success = True
+            # A FIX attempt may have left an error behind even though the
+            # final run passed. Don't archive a success with a stale failure.
+            self.current_program.error_message = None
             self._transition(State.ARCHIVE)
         else:
             # Process exited early, check if error
@@ -797,7 +854,8 @@ class Brain:
                     self.current_program.success = False
             else:
                 self.current_program.success = True
-            
+                self.current_program.error_message = None
+
             self._transition(State.ARCHIVE)
 
     def _do_fix(self):
