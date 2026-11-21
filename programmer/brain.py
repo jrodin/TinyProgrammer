@@ -7,9 +7,11 @@ THINK → WRITE → REVIEW → RUN → WATCH → ARCHIVE → REFLECT → repeat
 Optional BBS breaks can lead into REMINISCE, which replays archived creations.
 """
 
+import ast
 import os
 import sys
 import json
+import re
 import time
 import random
 import select
@@ -64,21 +66,93 @@ class Program:
     canvas_protocol: str = CANVAS_PROTOCOL_LEGACY
 
 
-def _clean_generated_code(raw: str) -> str:
-    """Strip markdown fences and bare ``python`` language tags from generated code.
+def _is_generated_boilerplate(line: str) -> bool:
+    """True for lines the model re-emits even though the runner provides them.
 
-    The runtime cleans before review/run; archiving without this step persists
-    unparseable source even on successful runs (issue #43). Centralizing the
-    cleaning here keeps review, run, and archive in sync.
+    Local models routinely repeat the header (`import tiny_canvas`,
+    `c = tiny_canvas.Canvas(693, 318)`) or wrap code in fences despite the
+    prompt. Keeping the assignment shadows the real Canvas with a module, so
+    drop header/import lines centrally before review, run, and archive.
+    """
+    stripped = (line or "").strip()
+    if not stripped:
+        return False
+    if stripped in ("python", "py"):
+        return True
+    if stripped.startswith("```"):
+        return True
+    if stripped.startswith("import ") or stripped.startswith("from "):
+        return True
+    if re.match(r"^c\s*=", stripped):
+        return True
+    if re.match(r"^p\s*=\s*Plot3D\(", stripped):
+        return True
+    return False
+
+
+def _parses_as_python(text: str) -> bool:
+    """True when ``text`` is syntactically valid Python (it is not executed)."""
+    try:
+        compile(text, "<generated>", "exec")
+        return True
+    except (SyntaxError, ValueError):
+        return False
+
+
+# Public drawing/screen methods on Canvas. update/move and the underscore
+# methods are runner internals, not part of the language given to the model.
+_CANVAS_METHODS = frozenset({
+    "clear", "pixel", "line", "rect", "fill_rect", "circle", "fill_circle",
+    "show", "sleep",
+})
+
+
+def _unknown_canvas_methods(code: str) -> list[str]:
+    """Return called ``c.<name>`` methods that the canvas does not provide.
+
+    Checks the AST rather than raw text so comments and strings cannot trigger
+    a false positive. Invented methods (c._get_hash, c.new, c.random, ...) are
+    a frequent failure: without this check they only fail after a full WATCH,
+    and the FIX prompt then has to rediscover the same problem.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    found = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "c"
+                and node.func.attr not in _CANVAS_METHODS):
+            found.add(node.func.attr)
+    return sorted(found)
+
+
+def _clean_generated_code(raw: str) -> str:
+    """Strip fences and any repeated runner header from generated code.
+
+    The caller prepends a fresh header afterwards. Dropping a second
+    `c = ...` matters: it shadows the real Canvas and produces
+    "module 'tiny_canvas' has no attribute 'clear'" at runtime.
     """
     lines = (raw or "").split("\n")
-    cleaned: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("```") or stripped == "python":
-            continue
-        cleaned.append(line)
-    return "\n".join(cleaned).strip()
+    cleaned = [line for line in lines if not _is_generated_boilerplate(line)]
+    body = "\n".join(cleaned).strip()
+
+    # Models sometimes open with a sentence ("Here is the program:") despite
+    # the prompt. That line is a syntax error, so drop leading lines until the
+    # remainder parses. Guarded by the parse check: valid bodies are untouched,
+    # and a genuinely broken body still reaches the normal FIX path.
+    if body and not _parses_as_python(body):
+        for i in range(1, min(len(cleaned), 6)):
+            candidate = "\n".join(cleaned[i:]).strip()
+            if candidate and _parses_as_python(candidate):
+                body = candidate
+                break
+
+    return body
 
 
 def _typing_delay_range() -> tuple[float, float]:
@@ -523,19 +597,8 @@ class Brain:
 
         in_code_block = False
 
-        # Track lines to filter duplicates from LLM output
+        # Track lines so repeated header/import lines can be dropped.
         current_line = ""
-        skip_patterns = [
-            "import time",
-            "import random",
-            "import math",
-            "from tiny_canvas import Canvas",
-            "c = Canvas()",
-            "from tiny_plot3d import Plot3D",
-            "p = Plot3D(c)",
-            "python",  # From ```python markdown
-            "",  # Empty lines at start
-        ]
 
         # Stream from LLM - filter duplicate header lines
         try:
@@ -565,13 +628,12 @@ class Brain:
                     # When we hit a newline, check if line should be skipped
                     if char == '\n':
                         line_stripped = current_line.strip()
-                        should_skip = any(line_stripped == pat for pat in skip_patterns)
 
-                        if not should_skip:
+                        if not _is_generated_boilerplate(line_stripped):
                             # Output the line
                             code_typing.type_text(current_line)
                             full_code += current_line
-                        else:
+                        elif line_stripped and not line_stripped.startswith("```"):
                             print(f"[Brain] Skipping duplicate: {line_stripped}")
 
                         current_line = ""
@@ -589,7 +651,7 @@ class Brain:
             return
 
         # Output any remaining buffered content
-        if current_line:
+        if current_line and not _is_generated_boilerplate(current_line.strip()):
             code_typing.type_text(current_line)
             full_code += current_line
 
@@ -608,10 +670,31 @@ class Brain:
         self.terminal.type_string("\n# checking my work...\n")
         time.sleep(1)
         
-        # Clean once and write back so review, run, and archive all see the
-        # same parseable Python (issue #43).
-        code = _clean_generated_code(self.current_program.code)
+        # Canonicalize: exactly one runner header + cleaned body. Models often
+        # re-emit imports or even `c = tiny_canvas.Canvas(...)`, and a late
+        # `c =` shadows the real Canvas. Fix output may omit the header
+        # entirely, so always rebuild it here.
+        header = self.llm.get_header(
+            self.current_program.program_type if self.current_program else "")
+        body = _clean_generated_code(self.current_program.code)
+        code = header + ("\n" + body if body else "")
         self.current_program.code = code
+
+        # 0a. A bare header compiles but can never draw. Fail early instead of
+        # running an empty program and archiving a two-line "success".
+        if not body:
+            msg = ("The response contained no program body, only the header. "
+                   "Write the actual program after the header.")
+            log_error(self.current_program.program_type, "review", msg)
+            self.terminal.type_string("# I forgot to write the program!\n")
+            if self.fix_attempts < 2:
+                self.current_program.error_message = msg
+                self._transition(State.FIX)
+                return
+            self.terminal.type_string("# still empty, giving up.\n")
+            self.current_program.success = False
+            self._transition(State.ARCHIVE)
+            return
 
         # 0. Degenerate repetition. The LLM client cuts the stream when the
         # model starts looping, so whatever we have is incomplete even if it
@@ -670,7 +753,29 @@ class Brain:
                 self.current_program.success = False
                 self._transition(State.ARCHIVE)
                 return
-            
+
+        # 2a. Invented canvas methods are another common "looks fine until it
+        # runs" failure. Reject them here so FIX gets a precise hint instead of
+        # wasting a full WATCH cycle and a generic AttributeError.
+        bad_methods = _unknown_canvas_methods(code)
+        if bad_methods:
+            msg = (
+                "Unknown canvas method(s): "
+                + ", ".join(f"c.{name}" for name in bad_methods)
+                + ". Only these methods exist: "
+                + ", ".join(sorted(_CANVAS_METHODS)) + "."
+            )
+            log_error(self.current_program.program_type, "review", msg)
+            self.terminal.type_string("# I invented a canvas method!\n")
+            if self.fix_attempts < 2:
+                self.current_program.error_message = msg
+                self._transition(State.FIX)
+                return
+            self.current_program.error_message = msg
+            self.current_program.success = False
+            self._transition(State.ARCHIVE)
+            return
+
         self.terminal.type_string("# looks good!\n")
         time.sleep(0.5)
         self._transition(State.RUN)
@@ -727,6 +832,9 @@ class Brain:
             )
         if exit_code is None:
             self.current_program.success = True
+            # A FIX attempt may have left an error behind even though the
+            # final run passed. Don't archive a success with a stale failure.
+            self.current_program.error_message = None
             self._transition(State.ARCHIVE)
         else:
             # Process exited early, check if error
@@ -746,7 +854,8 @@ class Brain:
                     self.current_program.success = False
             else:
                 self.current_program.success = True
-            
+                self.current_program.error_message = None
+
             self._transition(State.ARCHIVE)
 
     def _do_fix(self):
@@ -810,37 +919,41 @@ class Brain:
         time.sleep(1)
         
         # Determine result string
-        if self.current_program.success:
-            result = "Success."
-        else:
+        if not self.current_program.success:
             result = f"Failed. Error: {self.current_program.error_message}"
-            
-        prompt = self.llm.build_reflection_prompt(
-            self.current_program.code,
-            self.current_program.program_type,
-            result,
-        )
-        
-        # Stream reflection
-        lesson = ""
-        try:
-            for token in self.llm.stream(prompt, max_tokens=config.LLM_MAX_TOKENS,
-                                            temperature=config.LLM_TEMPERATURE,
-                                            stop=["<|im_end|>"]):
-                # Filter newlines to keep it clean
-                token = token.replace("\n", " ")
-                lesson += token
-                for char in token:
-                    self.terminal.type_char(char)
-                    time.sleep(random.uniform(0.01, 0.05))
-                    self.terminal.tick()
-        except Exception:
-            pass
-            
-        if lesson and not getattr(self.llm, "last_looped", False):
-            self.learning.add_lesson(lesson)
-            self.terminal.type_string("\n# saved to memory.\n")
-        
+
+            prompt = self.llm.build_reflection_prompt(
+                self.current_program.code,
+                self.current_program.program_type,
+                result,
+            )
+
+            # Stream reflection. This is a one-sentence note, not a program:
+            # the old LLM_MAX_TOKENS budget let it ramble into self-correcting
+            # essays that then got stored verbatim and fed back into prompts.
+            lesson = ""
+            try:
+                for token in self.llm.stream(prompt, max_tokens=96,
+                                             temperature=0.2,
+                                             stop=["<|im_end|>"]):
+                    # Filter newlines to keep it clean
+                    token = token.replace("\n", " ")
+                    lesson += token
+                    for char in token:
+                        self.terminal.type_char(char)
+                        time.sleep(random.uniform(0.01, 0.05))
+                        self.terminal.tick()
+            except Exception:
+                pass
+
+            if lesson and not getattr(self.llm, "last_looped", False):
+                if self.learning.add_lesson(lesson):
+                    self.terminal.type_string("\n# saved to memory.\n")
+        else:
+            # A clean run has no failure signal; asking for a lesson anyway just
+            # invented generic advice that polluted later prompts.
+            self.terminal.type_string("\n# it worked — nothing to fix.\n")
+
         time.sleep(2)
 
         # BBS break chance after reflecting
